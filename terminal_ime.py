@@ -5,8 +5,6 @@ import random
 import re
 import subprocess
 import sys
-import termios
-import tty
 import webbrowser
 
 # ================= 配置與路徑 =================
@@ -17,13 +15,12 @@ HISTORY_FILE = os.path.join(USER_DICTS_DIR, "user_history.json")
 if not os.path.exists(USER_DICTS_DIR):
     os.makedirs(USER_DICTS_DIR)
 
+
 # ================= 核心工具函數 =================
-
-
 def load_all_dicts():
     hanzi_path = os.path.join(BASE_PATH, "dict_hanzi.json")
     cizu_path = os.path.join(BASE_PATH, "dict_cizu.json")
-    data, phrases = {}, []
+    data = {}
 
     history = {}
     if os.path.exists(HISTORY_FILE):
@@ -39,11 +36,9 @@ def load_all_dicts():
                 with open(path, "r", encoding="utf-8") as f:
                     new_data = json.load(f)
                     for py, words in new_data.items():
-                        # 歷史高頻詞排在前面
                         sorted_words = sorted(
                             words, key=lambda w: history.get(w, 0), reverse=True
                         )
-                        phrases.extend(words)
                         if py in data:
                             data[py] = list(dict.fromkeys(sorted_words + data[py]))
                         else:
@@ -59,7 +54,7 @@ def load_all_dicts():
             if filename.endswith(".json") and filename != "user_history.json":
                 merge_dict(os.path.join(USER_DICTS_DIR, filename))
 
-    return data, list(set(phrases)), history
+    return data, history
 
 
 def save_history(history):
@@ -94,19 +89,6 @@ def copy_to_clipboard(text):
         return False
 
 
-def get_key():
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            ch += sys.stdin.read(2)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    return ch
-
-
 def split_pinyin(dict_data, text):
     if not text:
         return []
@@ -115,7 +97,8 @@ def split_pinyin(dict_data, text):
         matched = False
         for length in range(6, 0, -1):
             part = text[idx : idx + length]
-            if part in dict_data:
+            # 優先匹配原始大小寫，失敗則匹配小寫
+            if part in dict_data or part.lower() in dict_data:
                 res.append(part)
                 idx += length
                 matched = True
@@ -126,195 +109,170 @@ def split_pinyin(dict_data, text):
     return res
 
 
-# ================= 快捷模式邏輯 =================
+def split_input_segments(input_str):
+    # 修改正則以包含大寫字母 A-Z
+    pattern = r"(/[a-zA-Z0-9]+)|([a-zA-Z0-9']+)|([^a-zA-Z0-9'/]+)"
+    matches = re.findall(pattern, input_str)
+    segments = []
+    for raw_part, pinyin_part, punct_part in matches:
+        if raw_part:
+            segments.append(("raw", raw_part))
+        elif pinyin_part:
+            segments.append(("pinyin", pinyin_part))
+        elif punct_part:
+            segments.append(("punct", punct_part))
+    return segments
 
 
+# ================= 顏色定義 =================
+BLUE = "\033[94m"
+GREEN = "\033[92m"
+GRAY = "\033[90m"
+RESET = "\033[0m"
+
+
+# ================= 轉換邏輯 =================
 def quick_convert(dict_data, args, history):
     should_open = "-o" in args
+
+    l_match = next(
+        (re.match(r"^-l(\d*)$", a) for a in args if a.startswith("-l")), None
+    )
     a_match = next(
         (re.match(r"^-a(\d*)$", a) for a in args if a.startswith("-a")), None
     )
     r_match = next(
         (re.match(r"^-r(\d*)$", a) for a in args if a.startswith("-r")), None
     )
-    clean_args = [a for a in args if not a.startswith("-")]
-    query = "".join(clean_args).lower()
 
-    if not query:
-        return "用法: ime [拼音] [-aN] [-rN] [-o]"
+    clean_args = [
+        a
+        for a in args
+        if not (
+            a.startswith("-l") or a.startswith("-a") or a.startswith("-r") or a == "-o"
+        )
+    ]
+    query_raw = " ".join(clean_args)
+
+    if not query_raw:
+        return "用法: ime [拼音] [/英文] [-l] [-a] [-r] [-o]"
 
     # 列表模式
-    if a_match:
-        cands = dict_data.get(query, [])
+    if a_match or l_match:
+        # 這裡過濾保留大小寫以便搜尋詞庫
+        pure_pinyin = re.sub(r"[^a-zA-Z0-9']", "", query_raw)
+        cands = dict_data.get(pure_pinyin)
+
+        # 找不到則嘗試小寫搜尋
         if not cands:
-            return f"未找到: {query}"
-        limit = int(a_match.group(1)) if a_match.group(1) else None
-        return "\n".join(cands[:limit])
+            cands = dict_data.get(pure_pinyin.lower(), [])
 
-    # 正常或隨機模式
+        if not cands:
+            print(f"未找到對應詞條: {pure_pinyin}")
+            return f"未找到對應詞條: {pure_pinyin}"
+
+        if a_match:
+            limit = int(a_match.group(1)) if a_match.group(1) else 60
+            listed = cands[:limit]
+            lines = []
+            for i in range(0, len(listed), 10):
+                chunk = listed[i : i + 10]
+                line_parts = [
+                    f"  {BLUE}{i + j + 1:02d}{GRAY}.{RESET} {GREEN}{word}{RESET}"
+                    for j, word in enumerate(chunk)
+                ]
+                lines.append("  ".join(line_parts))
+            result = "\n".join(lines)
+        else:
+            limit = int(l_match.group(1)) if l_match.group(1) else 10
+            listed = cands[:limit]
+            result = "\n".join(
+                [
+                    f"  {BLUE}{i + 1:02d}{GRAY}.{RESET} {GREEN}{word}{RESET}"
+                    for i, word in enumerate(listed)
+                ]
+            )
+
+        print(result)
+        return result
+
+    # 正常轉換模式
     count = int(r_match.group(1)) if (r_match and r_match.group(1)) else 1
-    results = []
-    for _ in range(count):
-        tokens = re.findall(r"([a-z']+)([0-9]*)", query)
-        current_res = ""
-        for py_part, num_str in tokens if tokens else [(query, "")]:
-            if py_part in dict_data:
-                cands = dict_data[py_part]
-                if r_match:
-                    current_res += random.choice(cands)
-                else:
-                    idx = int(num_str) - 1 if num_str else 0
-                    current_res += cands[idx] if 0 <= idx < len(cands) else cands[0]
-            else:
-                for sp in split_pinyin(dict_data, py_part):
-                    if sp in dict_data:
-                        current_res += (
-                            random.choice(dict_data[sp])
-                            if r_match
-                            else dict_data[sp][0]
-                        )
-                    else:
-                        current_res += sp
-        results.append(current_res)
+    total_variants = []
 
-    final_text = " ".join(results)
+    for _ in range(count):
+        space_blocks = query_raw.split(" ")
+        converted_blocks = []
+
+        for block in space_blocks:
+            if not block:
+                continue
+
+            segments = split_input_segments(block)
+            block_res = ""
+
+            for seg_type, seg_content in segments:
+                if seg_type == "raw":
+                    block_res += seg_content[1:]
+                    continue
+
+                if seg_type == "punct":
+                    block_res += seg_content
+                    continue
+
+                # 修改正則以包含大寫
+                tokens = re.findall(r"([a-zA-Z']+)([0-9]*)", seg_content)
+                if not tokens:
+                    block_res += seg_content
+                    continue
+
+                for py_part, num_str in tokens:
+                    # 搜尋邏輯：優先原始，次之小寫
+                    cands = dict_data.get(py_part)
+                    if not cands:
+                        cands = dict_data.get(py_part.lower())
+
+                    if cands:
+                        if r_match:
+                            chosen = random.choice(cands)
+                        else:
+                            idx = int(num_str) - 1 if num_str else 0
+                            chosen = cands[idx] if 0 <= idx < len(cands) else cands[0]
+                        block_res += chosen
+                    else:
+                        # 分詞搜尋也支持大小寫
+                        for sp in split_pinyin(dict_data, py_part):
+                            sub_cands = dict_data.get(sp)
+                            if not sub_cands:
+                                sub_cands = dict_data.get(sp.lower())
+
+                            if sub_cands:
+                                chosen = (
+                                    random.choice(sub_cands)
+                                    if r_match
+                                    else sub_cands[0]
+                                )
+                                block_res += chosen
+                            else:
+                                block_res += sp
+            converted_blocks.append(block_res)
+
+        total_variants.append("".join(converted_blocks))
+
+    final_text = "\n".join(total_variants)
     copy_to_clipboard(final_text)
-    learn_from_text(final_text, history)  # 快捷模式也進行學習
+    learn_from_text(final_text, history)
+
     if should_open:
         webbrowser.open(f"https://www.google.com/search?q={final_text}")
+
+    print(final_text)
     return final_text
 
 
-# ================= 交互模式 =================
-
-
-def interactive_mode(data, phrases, history):
-    buffer, committed, full_history = "", "", ""
-    page_index, PAGE_SIZE = 0, 9
-
-    print("\033[1;34m--- Terminal IME v8.1 (全功能修復版) ---\033[0m")
-
-    try:
-        while True:
-            ghost_text, current_first_cand = "", ""
-            if buffer:
-                all_cands = data.get(buffer, [])
-                if not all_cands:
-                    segments = split_pinyin(data, buffer)
-                    current_first_cand = "".join(
-                        [data[s][0] if s in data else s for s in segments]
-                    )
-                else:
-                    current_first_cand = all_cands[0]
-
-                matches = [
-                    p
-                    for p in phrases
-                    if p.startswith(current_first_cand)
-                    and len(p) > len(current_first_cand)
-                ]
-                if matches:
-                    best_match = max(
-                        matches, key=lambda x: (history.get(x, 0), -len(x))
-                    )
-                    ghost_text = best_match[len(current_first_cand) :]
-
-            sys.stdout.write(
-                f"\r\033[K\033[32m已輸入:\033[0m {full_history}{committed}"
-            )
-            if buffer:
-                sys.stdout.write(
-                    f"\033[33m{current_first_cand}\033[0m\033[90m{ghost_text}\033[0m \033[2m({buffer})\033[0m"
-                )
-
-            candidates = []
-            if buffer:
-                all_cands = data.get(
-                    buffer, [current_first_cand] if current_first_cand else []
-                )
-                total_pages = (len(all_cands) - 1) // PAGE_SIZE + 1
-                page_index = max(0, min(page_index, total_pages - 1))
-                candidates = all_cands[
-                    page_index * PAGE_SIZE : (page_index + 1) * PAGE_SIZE
-                ]
-                if candidates:
-                    cand_str = "  ".join(
-                        [f"{i + 1}.{c}" for i, c in enumerate(candidates)]
-                    )
-                    sys.stdout.write(
-                        f"\n\033[K\033[36m候選({page_index + 1}/{total_pages}):\033[0m {cand_str}\033[F"
-                    )
-            else:
-                sys.stdout.write(f"\n\033[K\033[F")
-            sys.stdout.flush()
-
-            key = get_key()
-
-            if (key == "\t" or key == "\x1b[C") and (ghost_text or buffer):
-                committed += current_first_cand + ghost_text
-                buffer = ""
-                continue
-
-            if key in ("\x04", "\x03"):
-                break
-
-            elif key in ("\x7f", "\x08"):
-                if buffer:
-                    buffer = buffer[:-1]
-                elif committed:
-                    committed = committed[:-1]
-
-            elif key in ("=", "."):
-                if buffer:
-                    page_index += 1
-                else:
-                    committed += "。" if key == "." else "="
-            elif key in ("-", ","):
-                if buffer:
-                    page_index = max(0, page_index - 1)
-                else:
-                    committed += "，" if key == "," else "-"
-
-            elif key.isdigit() and buffer:
-                idx = int(key) - 1
-                if 0 <= idx < len(candidates):
-                    committed += candidates[idx]
-                    buffer = ""
-                    page_index = 0
-
-            elif (key.isalpha() or key == "'") and len(key) == 1:
-                buffer += key.lower()
-                page_index = 0
-
-            elif key == " ":
-                if buffer and candidates:
-                    committed += candidates[0]
-                    buffer = ""
-                    page_index = 0
-                else:
-                    committed += " "
-
-            elif key in ("\r", "\n"):
-                if buffer:
-                    committed += buffer
-                    buffer = ""
-                elif committed:
-                    full_history += committed + "\n"
-                    committed = ""
-                    sys.stdout.write("\n")
-    finally:
-        final_output = full_history + committed
-        learn_from_text(final_output, history)
-        copy_to_clipboard(final_output)
-        print(f"\n[OK] 內容已複製並學習成功。")
-
-
-# ================= 入口 =================
-
 if __name__ == "__main__":
-    data, phrases, history = load_all_dicts()
+    data, history = load_all_dicts()
     if len(sys.argv) > 1:
-        # 修復：重新啟用快速轉換模式入口
-        print(quick_convert(data, sys.argv[1:], history))
+        quick_convert(data, sys.argv[1:], history)
     else:
-        interactive_mode(data, phrases, history)
+        print(quick_convert(data, [], history))
