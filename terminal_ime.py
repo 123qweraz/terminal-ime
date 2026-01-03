@@ -97,7 +97,8 @@ def split_pinyin(dict_data, text):
         matched = False
         for length in range(6, 0, -1):
             part = text[idx : idx + length]
-            if part in dict_data:
+            # 優先匹配原始大小寫，失敗則匹配小寫
+            if part in dict_data or part.lower() in dict_data:
                 res.append(part)
                 idx += length
                 matched = True
@@ -108,19 +109,15 @@ def split_pinyin(dict_data, text):
     return res
 
 
-# ================= 新增：拆分输入为「拼音段」和「标点/非拼音段」 =================
 def split_input_segments(input_str):
-    """
-    拆分输入字符串，返回片段列表，每个片段是(类型, 内容)，类型为"pinyin"或"punct"
-    拼音段：包含a-z、'、0-9（拼音和序号）
-    标点段：中英文标点、其他非拼音字符（原样保留）
-    """
-    # 匹配拼音段（字母、单引号、数字）和非拼音段（其他所有字符）
-    pattern = r"([a-z0-9']+)|([^a-z0-9']+)"
-    matches = re.findall(pattern, input_str.lower())
+    # 修改正則以包含大寫字母 A-Z
+    pattern = r"(/[a-zA-Z0-9]+)|([a-zA-Z0-9']+)|([^a-zA-Z0-9'/]+)"
+    matches = re.findall(pattern, input_str)
     segments = []
-    for pinyin_part, punct_part in matches:
-        if pinyin_part:
+    for raw_part, pinyin_part, punct_part in matches:
+        if raw_part:
+            segments.append(("raw", raw_part))
+        elif pinyin_part:
             segments.append(("pinyin", pinyin_part))
         elif punct_part:
             segments.append(("punct", punct_part))
@@ -128,13 +125,13 @@ def split_input_segments(input_str):
 
 
 # ================= 顏色定義 =================
-BLUE = "\033[94m"  # 數字：亮藍
-GREEN = "\033[92m"  # 漢字：亮綠
-GRAY = "\033[90m"  # 點號
+BLUE = "\033[94m"
+GREEN = "\033[92m"
+GRAY = "\033[90m"
 RESET = "\033[0m"
 
 
-# ================= 快捷模式（美化版，已修改标点处理逻辑） =================
+# ================= 轉換邏輯 =================
 def quick_convert(dict_data, args, history):
     should_open = "-o" in args
 
@@ -155,102 +152,114 @@ def quick_convert(dict_data, args, history):
             a.startswith("-l") or a.startswith("-a") or a.startswith("-r") or a == "-o"
         )
     ]
-    query = "".join(clean_args)  # 不再直接转小写，拆分片段时统一处理
+    query_raw = " ".join(clean_args)
 
-    if not query:
-        return (
-            "用法: ime [拼音+标点] [-l[N]] [-a[N]] [-r[N]] [-o]\n"
-            "例子:\n"
-            "  ime nihao,wohao         → 輸出「你好,我好」\n"
-            "  ime nihao5!             → 輸出第5個+！\n"
-            "  ime -l nihao,           → 垂直列表（彩色）\n"
-            "  ime -a yi.              → 橫向每行10個（數字藍、漢字綠）\n"
-            "  ime -a30 yi?            → 前30個橫向排列"
-        )
+    if not query_raw:
+        return "用法: ime [拼音] [/英文] [-l] [-a] [-r] [-o]"
 
-    # 橫向排列模式：-a（主要用于纯拼音查询，兼容标点输入）
-    if a_match:
-        # 提取纯拼音部分进行查询（-a模式不保留标点的查询匹配）
-        pure_pinyin = re.sub(r"[^a-z0-9']", "", query.lower())
-        cands = dict_data.get(pure_pinyin, [])
+    # 列表模式
+    if a_match or l_match:
+        # 這裡過濾保留大小寫以便搜尋詞庫
+        pure_pinyin = re.sub(r"[^a-zA-Z0-9']", "", query_raw)
+        cands = dict_data.get(pure_pinyin)
+
+        # 找不到則嘗試小寫搜尋
         if not cands:
-            return f"未找到對應詞條: {pure_pinyin}"
-        limit = int(a_match.group(1)) if a_match.group(1) else 60
-        listed = cands[:limit]
+            cands = dict_data.get(pure_pinyin.lower(), [])
 
-        lines = []
-        for i in range(0, len(listed), 10):
-            chunk = listed[i : i + 10]
-            line_parts = []
-            for j, word in enumerate(chunk):
-                num = i + j + 1
-                num_str = f"{num:02d}"
-                colored = f"  {BLUE}{num_str}{GRAY}.{RESET} {GREEN}{word}{RESET}"
-                line_parts.append(colored)
-            lines.append("  ".join(line_parts))
-        result = "\n".join(lines)
+        if not cands:
+            print(f"未找到對應詞條: {pure_pinyin}")
+            return f"未找到對應詞條: {pure_pinyin}"
+
+        if a_match:
+            limit = int(a_match.group(1)) if a_match.group(1) else 60
+            listed = cands[:limit]
+            lines = []
+            for i in range(0, len(listed), 10):
+                chunk = listed[i : i + 10]
+                line_parts = [
+                    f"  {BLUE}{i + j + 1:02d}{GRAY}.{RESET} {GREEN}{word}{RESET}"
+                    for j, word in enumerate(chunk)
+                ]
+                lines.append("  ".join(line_parts))
+            result = "\n".join(lines)
+        else:
+            limit = int(l_match.group(1)) if l_match.group(1) else 10
+            listed = cands[:limit]
+            result = "\n".join(
+                [
+                    f"  {BLUE}{i + 1:02d}{GRAY}.{RESET} {GREEN}{word}{RESET}"
+                    for i, word in enumerate(listed)
+                ]
+            )
+
         print(result)
         return result
 
-    # 垂直列表模式：-l（主要用于纯拼音查询，兼容标点输入）
-    if l_match:
-        # 提取纯拼音部分进行查询
-        pure_pinyin = re.sub(r"[^a-z0-9']", "", query.lower())
-        cands = dict_data.get(pure_pinyin, [])
-        if not cands:
-            return f"未找到對應詞條: {pure_pinyin}"
-        limit = int(l_match.group(1)) if l_match.group(1) else 10
-        listed = cands[:limit]
-
-        lines = []
-        for i, word in enumerate(listed):
-            num_str = f"{i + 1:02d}"
-            colored = f"  {BLUE}{num_str}{GRAY}.{RESET} {GREEN}{word}{RESET}"
-            lines.append(colored)
-        result = "\n".join(lines)
-        print(result)
-        return result
-
-    # 正常轉換或隨機模式（核心修改：支持保留标点）
+    # 正常轉換模式
     count = int(r_match.group(1)) if (r_match and r_match.group(1)) else 1
-    results = []
+    total_variants = []
 
     for _ in range(count):
-        # 拆分输入为「拼音段」和「标点段」
-        segments = split_input_segments(query)
-        current_res = ""
+        space_blocks = query_raw.split(" ")
+        converted_blocks = []
 
-        for seg_type, seg_content in segments:
-            # 标点段：直接原样追加
-            if seg_type == "punct":
-                current_res += seg_content
+        for block in space_blocks:
+            if not block:
                 continue
 
-            # 拼音段：按原有逻辑处理转换
-            tokens = re.findall(r"([a-z']+)([0-9]*)", seg_content)
-            for py_part, num_str in tokens if tokens else [(seg_content, "")]:
-                if py_part in dict_data:
-                    cands = dict_data[py_part]
-                    if r_match:
-                        chosen = random.choice(cands)
-                    else:
-                        idx = int(num_str) - 1 if num_str else 0
-                        chosen = cands[idx] if 0 <= idx < len(cands) else cands[0]
-                    current_res += chosen
-                else:
-                    for sp in split_pinyin(dict_data, py_part):
-                        if sp in dict_data:
-                            sub_cands = dict_data[sp]
-                            chosen = (
-                                random.choice(sub_cands) if r_match else sub_cands[0]
-                            )
-                            current_res += chosen
+            segments = split_input_segments(block)
+            block_res = ""
+
+            for seg_type, seg_content in segments:
+                if seg_type == "raw":
+                    block_res += seg_content[1:]
+                    continue
+
+                if seg_type == "punct":
+                    block_res += seg_content
+                    continue
+
+                # 修改正則以包含大寫
+                tokens = re.findall(r"([a-zA-Z']+)([0-9]*)", seg_content)
+                if not tokens:
+                    block_res += seg_content
+                    continue
+
+                for py_part, num_str in tokens:
+                    # 搜尋邏輯：優先原始，次之小寫
+                    cands = dict_data.get(py_part)
+                    if not cands:
+                        cands = dict_data.get(py_part.lower())
+
+                    if cands:
+                        if r_match:
+                            chosen = random.choice(cands)
                         else:
-                            current_res += sp
+                            idx = int(num_str) - 1 if num_str else 0
+                            chosen = cands[idx] if 0 <= idx < len(cands) else cands[0]
+                        block_res += chosen
+                    else:
+                        # 分詞搜尋也支持大小寫
+                        for sp in split_pinyin(dict_data, py_part):
+                            sub_cands = dict_data.get(sp)
+                            if not sub_cands:
+                                sub_cands = dict_data.get(sp.lower())
 
-        results.append(current_res)
+                            if sub_cands:
+                                chosen = (
+                                    random.choice(sub_cands)
+                                    if r_match
+                                    else sub_cands[0]
+                                )
+                                block_res += chosen
+                            else:
+                                block_res += sp
+            converted_blocks.append(block_res)
 
-    final_text = " ".join(results)
+        total_variants.append("".join(converted_blocks))
+
+    final_text = "\n".join(total_variants)
     copy_to_clipboard(final_text)
     learn_from_text(final_text, history)
 
@@ -261,7 +270,6 @@ def quick_convert(dict_data, args, history):
     return final_text
 
 
-# ================= 入口 =================
 if __name__ == "__main__":
     data, history = load_all_dicts()
     if len(sys.argv) > 1:
